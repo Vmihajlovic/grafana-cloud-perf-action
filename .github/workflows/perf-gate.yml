@@ -1,0 +1,28 @@
+name: Performance Gate
+
+on:
+  pull_request:
+    paths:
+      - 'testenv/services/**'
+
+jobs:
+  perf-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: grafana/setup-k6-action@v1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Profile Analysis
+        uses: ./.github/actions/profile-analysis
+        with:
+          grafana-cloud-url: ${{ secrets.GRAFANA_CLOUD_URL }}
+          grafana-cloud-token: ${{ secrets.GRAFANA_CLOUD_TOKEN }}
+          service-name: product-catalog
+          k6-script: k6/regression-test.js
+          baseline-window: 7d
+          generate-k6-test: 'true'

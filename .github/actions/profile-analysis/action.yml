@@ -1,0 +1,161 @@
+name: 'Profile Analysis (Grafana Cloud)'
+description: 'Detect performance regressions using Grafana Cloud profiles, traces, and AI analysis via Grafana Assistant'
+
+inputs:
+  grafana-cloud-url:
+    description: 'Grafana Cloud instance URL (e.g. https://mystack.grafana.net)'
+    required: true
+  grafana-cloud-token:
+    description: 'Grafana Cloud service account token (Editor role required)'
+    required: true
+  service-name:
+    description: 'Name of the service to analyze (as it appears in Grafana Cloud)'
+    required: true
+  k6-script:
+    description: 'Path to the k6 load test script'
+    required: true
+  k6-thresholds:
+    description: 'Whether to fail on k6 threshold violations'
+    default: 'true'
+  namespace:
+    description: 'Kubernetes namespace of the target service'
+    default: 'default'
+  baseline-window:
+    description: 'How far back to look for baseline comparison (e.g. 7d, 24h)'
+    default: '7d'
+  analysis-timeout:
+    description: 'Timeout in seconds for Assistant analysis'
+    default: '600'
+  generate-k6-test:
+    description: 'Ask Assistant to generate a regression test if issues are found'
+    default: 'false'
+  post-pr-comment:
+    description: 'Post analysis as a PR comment'
+    default: 'true'
+  source-path:
+    description: 'Path to source code for fix suggestions'
+    default: '.'
+
+outputs:
+  status:
+    description: '"pass" or "regression"'
+    value: ${{ steps.analyze.outputs.status }}
+  comment-body:
+    description: 'Markdown PR comment body'
+    value: ${{ steps.format.outputs.comment-body }}
+  context-id:
+    description: 'Assistant conversation context ID for follow-up'
+    value: ${{ steps.analyze.outputs.context-id }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install grafana-assistant CLI
+      shell: bash
+      run: pip install grafana-assistant
+
+    - name: Configure Assistant instance
+      shell: bash
+      run: |
+        grafana-assistant config set-instance ci \
+          --url "${{ inputs.grafana-cloud-url }}" \
+          --token '${GRAFANA_SA_TOKEN}'
+        grafana-assistant config use-instance ci
+      env:
+        GRAFANA_SA_TOKEN: ${{ inputs.grafana-cloud-token }}
+
+    - name: Run k6 load test
+      id: k6
+      shell: bash
+      run: |
+        echo "test_start=$(date -u +%s)" >> "$GITHUB_OUTPUT"
+        k6 run "${{ inputs.k6-script }}" \
+          --summary-export k6-summary.json \
+          ${{ inputs.k6-thresholds == 'true' && '' || '--no-thresholds' }} \
+          || echo "k6_failed=true" >> "$GITHUB_OUTPUT"
+        echo "test_end=$(date -u +%s)" >> "$GITHUB_OUTPUT"
+
+    - name: Collect git diff
+      id: diff
+      shell: bash
+      run: |
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          git diff "${{ github.event.pull_request.base.sha }}..HEAD" > git-diff.txt 2>/dev/null || true
+        else
+          git diff HEAD~1 > git-diff.txt 2>/dev/null || true
+        fi
+
+    - name: Analyze with Grafana Assistant
+      id: analyze
+      shell: bash
+      env:
+        GRAFANA_SA_TOKEN: ${{ inputs.grafana-cloud-token }}
+      run: |
+        SCRIPT_DIR="${{ github.action_path }}/scripts"
+        python3 "$SCRIPT_DIR/run_analysis.py" \
+          --service "${{ inputs.service-name }}" \
+          --namespace "${{ inputs.namespace }}" \
+          --test-start "${{ steps.k6.outputs.test_start }}" \
+          --test-end "${{ steps.k6.outputs.test_end }}" \
+          --baseline-window "${{ inputs.baseline-window }}" \
+          --timeout "${{ inputs.analysis-timeout }}" \
+          --generate-k6-test "${{ inputs.generate-k6-test }}" \
+          --source-path "${{ inputs.source-path }}" \
+          --k6-summary k6-summary.json \
+          --diff-file git-diff.txt \
+          --output analysis.json
+
+        # Set outputs from analysis
+        status=$(python3 -c "import json; d=json.load(open('analysis.json')); print(d.get('status','unknown'))")
+        context_id=$(python3 -c "import json; d=json.load(open('analysis.json')); print(d.get('context_id',''))")
+        echo "status=$status" >> "$GITHUB_OUTPUT"
+        echo "context-id=$context_id" >> "$GITHUB_OUTPUT"
+
+    - name: Format PR comment
+      id: format
+      shell: bash
+      run: |
+        python3 "${{ github.action_path }}/scripts/format_comment.py" \
+          --analysis analysis.json \
+          --k6-summary k6-summary.json \
+          --output comment.md
+
+        # Set multiline output
+        {
+          echo "comment-body<<EOF_COMMENT"
+          cat comment.md
+          echo "EOF_COMMENT"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Post PR comment
+      if: inputs.post-pr-comment == 'true' && github.event_name == 'pull_request'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        # Update existing comment or create new one
+        MARKER="<!-- grafana-cloud-perf-analysis -->"
+        COMMENT_ID=$(gh api \
+          "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
+          --jq ".[] | select(.body | contains(\"$MARKER\")) | .id" \
+          2>/dev/null | head -1)
+
+        BODY="${MARKER}
+        $(cat comment.md)"
+
+        if [ -n "$COMMENT_ID" ]; then
+          gh api \
+            "repos/${{ github.repository }}/issues/comments/$COMMENT_ID" \
+            -X PATCH -f body="$BODY"
+        else
+          gh api \
+            "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
+            -f body="$BODY"
+        fi
+
+    - name: Fail on regression
+      if: steps.analyze.outputs.status == 'regression'
+      shell: bash
+      run: |
+        echo "::error::Performance regression detected. See PR comment for details."
+        exit 1
