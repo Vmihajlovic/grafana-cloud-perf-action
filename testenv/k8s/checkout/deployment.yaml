@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkout
+  namespace: demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: checkout
+  template:
+    metadata:
+      labels:
+        app: checkout
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8084"
+    spec:
+      containers:
+        - name: checkout
+          image: checkout:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8084
+          env:
+            - name: PORT
+              value: "8084"
+            - name: CART_URL
+              value: http://cart:8082
+            - name: PRICING_URL
+              value: http://pricing:8083
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: alloy.monitoring.svc.cluster.local:4318
+            - name: OTEL_SERVICE_NAME
+              value: checkout
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8084
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: checkout
+  namespace: demo
+spec:
+  selector:
+    app: checkout
+  ports:
+    - port: 8084
+      targetPort: 8084

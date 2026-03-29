@@ -1,0 +1,16 @@
+{
+  "name": "frontend",
+  "version": "1.0.0",
+  "scripts": { "start": "node index.js" },
+  "dependencies": {
+    "express": "^4.21.0",
+    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/sdk-node": "^0.53.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.53.0",
+    "@opentelemetry/instrumentation-express": "^0.41.0",
+    "@opentelemetry/instrumentation-http": "^0.53.0",
+    "@opentelemetry/resources": "^1.26.0",
+    "@opentelemetry/semantic-conventions": "^1.26.0",
+    "prom-client": "^15.1.0"
+  }
+}
