@@ -231,68 +231,131 @@ PR push → k6 run → trigger Investigation (3-phase multi-signal analysis) →
 
 **Differentiator:** Multi-signal correlation that no single-tool approach can match. The investigation doesn't just say "this function is slow" — it says "this function is slow, error logs increased at the same time, traces show a new N+1 pattern, and the Prometheus p99 latency metric confirms this affects 5% of requests."
 
-#### Level 3: Autonomous Fix Loop (build third)
+#### Level 3: Post-Incident Prevention (build third)
 
-The autoresearch pattern applied to performance fixes.
+> **Key design decision:** The durable artifact from an incident is the **k6 test**, not the fix. The test is verifiable (it either catches the regression or it doesn't). The fix is the developer's job — the system provides analysis and suggestions, not authoritative code changes. See [Design Rationale: Why We Don't Auto-Generate Fixes](#design-rationale-why-we-dont-auto-generate-fixes) below.
 
-```
-Regression detected
-  → Assistant generates k6 test targeting the regression
-  → Assistant suggests code fix (with git diff context)
-  → Fix is applied on a branch
-  → k6 test runs against the fix
-  → If pass: draft PR with test + fix
-  → If fail: iterate (try different fix)
-  → Human reviews and merges
-```
-
-- Uses conversation threading (`--context`) for multi-turn: detect → generate test → suggest fix → verify
-- The generated k6 test becomes a permanent regression gate
-- Human-in-the-loop: fixes are draft PRs, never auto-merged
-- Closed feedback loop: merge/reject signals improve future suggestions
-
-**Differentiator:** This is the "profile → test → fix" pipeline that no competitor has. Datadog's Bits AI can generate fixes but doesn't generate reproducible performance tests from profile data.
-
-#### Level 4: Post-Incident Automation (build fourth)
-
-Connect the pipeline to Grafana IRM for reactive use.
+Connect the pipeline to Grafana IRM for reactive, post-incident use. No time pressure — the incident is already mitigated (rollback, scale up, circuit break). This mode is about **prevention**, not response.
 
 ```
-Incident created (via alert or manual)
-  → Trigger Investigation against the incident time window
-  → Generate k6 test that reproduces the incident load pattern
-  → Suggest fix based on profile analysis
-  → Create PR with test + fix
-  → When merged, the test becomes a permanent CI gate
-  → Close the loop: incident → test → fix → prevention
+Incident resolved
+  → Investigation runs against the incident time window (no rush)
+  → Multi-signal analysis: metrics + logs + traces + profiles
+  → Generates k6 test that encodes the failure mode
+  → Opens GitHub Issue with:
+      - Root cause analysis with evidence
+      - AI-suggested fix (clearly marked as suggestion, not verified)
+      - The k6 test script
+  → Dev team writes/reviews the fix
+  → The k6 test becomes a permanent CI gate
+  → That regression can never ship again
 ```
 
-- Incoming webhook from IRM triggers the action
-- The incident provides the time window and affected service
-- The generated test encodes the failure mode forever
-- This is "Use Case 1" from the OSS version, but fully automated with Cloud
+- Incoming webhook from IRM triggers the action after incident resolution
+- The incident provides the time window, affected service, and incident context
+- Investigation runs all 3 phases without time pressure — quality over speed
+- The k6 test is the permanent artifact: it encodes the failure mode forever
+- Fix suggestions are opt-in, clearly labeled as "AI suggestion, not verified"
+- The developer owns the fix; the system owns the test
 
-**Differentiator:** No competitor closes the loop from incident to permanent CI gate. PagerDuty and Rootly help with incident response but don't produce the artifact (test + fix) that prevents recurrence.
+**Differentiator:** No competitor closes the loop from incident to permanent CI gate. PagerDuty and Rootly help with incident response but don't produce the artifact (test) that prevents recurrence.
 
-#### Level 5: Self-Improving Pipeline (aspirational)
+#### Level 4: Self-Improving Pipeline (aspirational)
 
 The autoresearch endgame: the pipeline improves itself.
 
 ```
 Collect feedback signals:
-  - Was the fix PR merged or rejected?
+  - Was the suggested fix useful? (developer reaction)
   - Did the generated k6 test catch a future regression?
   - Did the investigation accurately identify the root cause?
-  - How long did the developer spend reviewing?
+  - How long did the developer spend on the issue after receiving the analysis?
 
 Feed back into:
   - Prompt optimization (GEPA-style reflective evolution)
-  - Investigation agent tuning (which signal patterns work best)
-  - Fix generation quality (which code patterns succeed)
-  - Test generation accuracy (which tests actually catch regressions)
+  - Investigation agent tuning (which signal patterns find root causes fastest)
+  - Test generation quality (which tests actually catch regressions)
 ```
 
 This requires Grafana Cloud to store and analyze the feedback loop data — which it already can (metrics + annotations).
+
+---
+
+### Design Rationale: Why We Don't Auto-Generate Fixes
+
+This section documents the deliberate decision to **not** build a fully automated "detect → fix → PR → merge" pipeline, even though it's technically possible. This is not a temporary limitation — it's a design principle.
+
+#### The problems with auto-generated fixes
+
+**1. Investigations identify WHERE, not HOW to fix.**
+
+Profiling tells you "regexp.Compile in a loop takes 80% of CPU." That's an easy fix. But most production regressions aren't that clean:
+- N+1 queries require architectural changes (batching, caching, query restructuring)
+- Lock contention may need a different concurrency model
+- GC pressure from allocation patterns may require API changes
+- Memory leaks may involve complex lifecycle management
+
+The investigation can pinpoint the function, but generating a *correct* fix is a fundamentally harder problem. Meta's FBDetect system achieves 42% accuracy on just *identifying* root cause after 7 years of tuning — and that's identification, not fix generation.
+
+**2. A generated k6 test that passes doesn't mean the fix is correct.**
+
+A k6 test that exercises the endpoint isn't the same as a test that reproduces the regression conditions. Production regressions often depend on:
+- Data volume (the bug only manifests with >10K products)
+- Concurrency patterns (race conditions under specific load)
+- Input distributions (certain search terms trigger the regex path)
+- Accumulated state (memory grows over hours, not minutes)
+
+"Hit /api/search with 10 VUs for 60 seconds" might pass even with the bug present if the dataset is small or the concurrency is low. A passing test on a wrong fix gives **false confidence** — worse than no test at all.
+
+**3. Incident pressure + authoritative-looking PR = dangerous.**
+
+This is the most important concern. During an incident:
+- Engineers are stressed and want to resolve fast
+- An auto-generated PR from "the investigation system" *looks* authoritative
+- A passing k6 test reinforces that authority
+- The human-in-the-loop safeguard is weaker when humans are under pressure
+- A wrong fix ships faster than it would if a human wrote it — because a human-written PR would get more scrutiny
+
+The very thing that makes the system feel valuable (speed, automation, authority) is what makes it dangerous when it's wrong.
+
+**4. The codebase context problem.**
+
+Investigations have telemetry context (metrics, logs, traces, profiles). But generating a code fix requires understanding:
+- The actual source code and its dependencies
+- Test patterns and conventions in the repo
+- Business logic constraints
+- API contracts with other services
+- Migration/deployment considerations
+
+The tunnel feature gives filesystem access interactively, but in an automated CI pipeline, you'd need to feed the AI the entire repo context. For large codebases (Uber has 5,000+ microservices), this is a non-trivial context and accuracy problem.
+
+**5. Timing: this isn't incident response, it's incident prevention.**
+
+By the time the investigation runs (Phase 1-3), the AI generates a fix, k6 runs, and a PR is created — that's 15-30 minutes minimum. The incident should already be mitigated by then (rollback, scale up, circuit break). The PR isn't for fixing the incident — it's for **ensuring that regression never ships again**.
+
+This distinction matters because it removes the time pressure that would justify cutting corners on review quality.
+
+#### What we do instead
+
+| Aspect | Auto-fix approach (rejected) | Our approach |
+|---|---|---|
+| Fix authorship | AI generates and pushes code | Developer writes the fix |
+| Fix verification | AI runs k6 test | Developer + existing CI suite |
+| k6 test generation | AI generates | AI generates (this IS the durable artifact) |
+| Trust model | "System says it's fixed" | "System shows what's wrong, developer decides how to fix" |
+| Incident pressure | PR ready during incident → rushed merge | Issue created post-incident → thoughtful review |
+| Fix suggestions | Committed code on a branch | Clearly labeled suggestion in issue body |
+| Failure mode | Wrong fix ships with false confidence | Developer ignores bad suggestion, writes own fix |
+
+#### When fix suggestions ARE appropriate
+
+Fix suggestions are valuable when clearly framed as suggestions:
+- Included in the GitHub Issue body, not as committed code
+- Labeled: "AI-suggested fix based on profiling analysis — not verified"
+- Accompanied by the evidence (flamegraph diff, trace data) so the developer can validate
+- Never auto-committed, never on a branch, never presented as ready-to-merge
+
+The developer's job is easier because they know WHERE the problem is and have a starting point for HOW to fix it. But they own the fix.
 
 ### What we can do better than everyone else
 
@@ -304,7 +367,7 @@ This requires Grafana Cloud to store and analyze the feedback loop data — whic
 
 4. **k6 is already in the ecosystem.** No need to integrate a third-party load testing tool. k6 Cloud results flow into Grafana Cloud. The `run-k6-action` already exists. We're adding the profiling layer on top.
 
-5. **The closed loop is unique.** incident → investigation → test → fix → CI gate → prevention. No one else has all the pieces in one platform: load testing (k6), profiling (Pyroscope), tracing (Tempo), metrics (Mimir), AI (Assistant), incidents (IRM), and CI integration (GitHub Actions).
+5. **The closed loop is unique.** incident → investigation → k6 test → CI gate → prevention. The durable artifact is the test, not a generated fix. No one else has all the pieces in one platform: load testing (k6), profiling (Pyroscope), tracing (Tempo), metrics (Mimir), AI (Assistant), incidents (IRM), and CI integration (GitHub Actions).
 
 6. **The autoresearch pattern gives us a self-improving system.** Because all the feedback signals (fix accepted/rejected, test passed/failed, regression recurred) flow through Grafana Cloud, we can build the optimization loop that competitors can't — they don't own the full pipeline.
 
@@ -320,7 +383,7 @@ This requires Grafana Cloud to store and analyze the feedback loop data — whic
 | Continuous profiling in analysis | **Yes** (Pyroscope) | Yes | No | No | No | No |
 | Multi-signal AI root cause | **Yes** (4 pillars) | Yes (Bits AI) | Yes (Davis) | Yes (NRAI) | No | No |
 | Test generation from profiles | **Yes (unique)** | No | No | No | No | No |
-| Fix PR generation | **Yes** | Yes (Bits AI) | No | No | No | No |
+| Fix suggestions (human-reviewed) | **Yes** (in issue, not PR) | Yes (Bits AI, auto-PR) | No | No | No | No |
 | Incident → CI gate loop | **Yes (unique)** | No | No | No | No | No |
 | Self-improving analysis | **Planned** | No | No | No | No | No |
 | No vendor lock-in (OSS tier) | **Yes** | No | No | No | Partial | No |
